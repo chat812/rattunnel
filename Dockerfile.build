@@ -1,0 +1,34 @@
+FROM rust:1-bookworm AS rathole-builder
+
+RUN rustup target add aarch64-unknown-linux-musl \
+    && apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src/rathole
+COPY rathole/ .
+RUN rm -f rust-toolchain rust-toolchain.toml
+
+# server: dynamic, default features
+RUN cargo build --release
+
+# agent: static, client-only + rustls
+RUN cargo build --release \
+    --target aarch64-unknown-linux-musl \
+    --no-default-features \
+    --features "client,rustls,noise,websocket-rustls"
+
+# -----------------------------------------------------------
+FROM rust:slim-bookworm AS qtun-builder
+
+RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/* \
+    && rustup target add aarch64-unknown-linux-musl
+
+WORKDIR /src/qtun-controller
+COPY qtun-controller/ .
+
+RUN cargo build --release --target aarch64-unknown-linux-musl
+
+# -----------------------------------------------------------
+FROM scratch AS export
+COPY --from=rathole-builder /src/rathole/target/release/rathole                              /rathole-server
+COPY --from=rathole-builder /src/rathole/target/aarch64-unknown-linux-musl/release/rathole   /rathole-agent
+COPY --from=qtun-builder    /src/qtun-controller/target/aarch64-unknown-linux-musl/release/qtun-controller /qtun-controller

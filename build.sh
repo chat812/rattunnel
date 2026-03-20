@@ -2,12 +2,11 @@
 #
 # Build script for RatTunnel
 #
-# Builds:
+# Builds all binaries inside Docker and copies them to ./build/
 #   - rathole server (dynamic, default features + api) — for Docker
 #   - rathole agent  (static, client-only with rustls) — for distribution
 #   - qtun-controller (static) — for Docker/distribution
 #
-# All binaries are copied to ./build/
 
 set -euo pipefail
 
@@ -25,29 +24,13 @@ fail()  { echo -e "${RED}[-]${NC} $1"; exit 1; }
 
 mkdir -p "$BUILD_DIR"
 
-# ---------- rathole server (dynamic, default features) ----------
-info "Building rathole server (dynamic, default features + api)..."
-cd "$SCRIPT_DIR/rathole"
-cargo build --release 2>&1 | tail -5
-cp target/release/rathole "$BUILD_DIR/rathole-server"
-ok "rathole-server built"
+info "Building all binaries in Docker..."
+cd "$SCRIPT_DIR"
 
-# ---------- rathole agent (static, client + rustls) ----------
-info "Building rathole agent (static, client-only + rustls)..."
-cd "$SCRIPT_DIR/rathole"
-RUSTFLAGS='-C target-feature=+crt-static' cargo build --release \
-    --no-default-features \
-    --features "client,rustls,noise,websocket-rustls" \
-    2>&1 | tail -5
-cp target/release/rathole "$BUILD_DIR/rathole-agent"
-ok "rathole-agent built"
+docker build -f Dockerfile.build --target export --output "type=local,dest=$BUILD_DIR" . \
+    || fail "Docker build failed"
 
-# ---------- qtun-controller (static) ----------
-info "Building qtun-controller (static)..."
-cd "$SCRIPT_DIR/qtun-controller"
-OPENSSL_STATIC=1 RUSTFLAGS='-C target-feature=+crt-static' cargo build --release 2>&1 | tail -5
-cp target/release/qtun-controller "$BUILD_DIR/qtun-controller"
-ok "qtun-controller built"
+ok "All binaries built"
 
 # ---------- Summary ----------
 echo ""

@@ -21,6 +21,7 @@ Thumbs.db
 *.swp
 *.swo
 
-# Binary
+# Binary / build output
+build/
 rathole/rathole
 qtun-controller/qtun-controller
