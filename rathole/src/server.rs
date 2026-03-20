@@ -602,7 +602,7 @@ where
         approval_webhook: Option<String>,
         approval_timeout: u64,
     ) -> ControlChannelHandle<T> {
-        let is_gateway = service.name == GATEWAY_SERVICE_NAME;
+        let is_gateway = protocol::is_gateway_service(&service.name);
 
         // Create a shutdown channel
         let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
