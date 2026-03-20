@@ -48,39 +48,45 @@ fi
 
 info "Server API: $SERVER_API_ADDR"
 
-# --- Check dependencies ---
-check_dep() {
-    if ! command -v "$1" &>/dev/null; then
-        info "Installing $1..."
-        apt-get update -qq && apt-get install -y -qq "$1" >/dev/null 2>&1 || true
-    fi
+# --- Detect architecture ---
+detect_arch() {
+    local machine
+    machine="$(uname -m)"
+    case "$machine" in
+        x86_64|amd64)      echo "x86_64" ;;
+        i686|i386|i586)     echo "i686" ;;
+        aarch64|arm64)      echo "aarch64" ;;
+        armv7*|armhf)       echo "armv7" ;;
+        *)                  echo "" ;;
+    esac
 }
 
-# --- Install Rust if needed ---
-if ! command -v cargo &>/dev/null; then
-    info "Installing Rust toolchain..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --quiet
-    source "$HOME/.cargo/env"
+ARCH="$(detect_arch)"
+[ -z "$ARCH" ] && err "Unsupported architecture: $(uname -m)"
+info "Detected architecture: $ARCH"
+
+# --- Download token ---
+DOWNLOAD_TOKEN="${2:-}"
+if [ -z "$DOWNLOAD_TOKEN" ]; then
+    echo -ne "${CYAN}Enter download token (from /download in Telegram): ${NC}"
+    read -r DOWNLOAD_TOKEN
+fi
+[ -z "$DOWNLOAD_TOKEN" ] && err "Download token is required"
+
+# --- Download pre-built binary ---
+DOWNLOAD_URL="http://$SERVER_API_ADDR/download/$DOWNLOAD_TOKEN/$ARCH"
+info "Downloading rathole-agent from server..."
+
+TMPDIR=$(mktemp -d)
+BINARY="$TMPDIR/rathole"
+
+if ! curl -sSfL -o "$BINARY" "$DOWNLOAD_URL"; then
+    err "Download failed — server unreachable or binary not available for $ARCH"
 fi
 
-# Ensure build deps
-check_dep git
-check_dep libssl-dev 2>/dev/null || check_dep openssl-devel 2>/dev/null || true
-check_dep pkg-config
-
-# --- Clone and build ---
-info "Cloning rattunnel..."
-TMPDIR=$(mktemp -d)
-git clone --depth 1 "$REPO_URL" "$TMPDIR/rattunnel" 2>/dev/null
-
-info "Building rathole agent (this may take a few minutes)..."
-cd "$TMPDIR/rattunnel/rathole"
-cargo build --release --locked 2>&1 | tail -3
-
-BINARY="$TMPDIR/rattunnel/rathole/target/release/rathole"
-[ -f "$BINARY" ] || err "Build failed — binary not found"
-
-ok "Build complete"
+[ -s "$BINARY" ] || err "Downloaded file is empty"
+chmod +x "$BINARY"
+ok "Download complete"
 
 # --- Install binary ---
 mkdir -p "$INSTALL_DIR"

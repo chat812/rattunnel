@@ -835,6 +835,9 @@ fn tcp_listen_and_send(
                             debug!("New visitor from {}", addr);
 
                             if require_approval && !pending::is_approved(&approved_map, &service_name, addr.ip()).await {
+                                // Check if this IP already has a pending request (avoid duplicate prompts)
+                                let already_pending = pending::is_pending(&pending_map, &service_name, addr.ip()).await;
+
                                 // Hold the connection and wait for approval
                                 let (id, approval_rx) = pending::insert(
                                     &pending_map, &service_name, addr.to_string()
@@ -842,9 +845,9 @@ fn tcp_listen_and_send(
 
                                 info!("Pending approval {} for visitor {} on service {}", id, addr, service_name);
 
-                                // Fire webhook notification (fire-and-forget)
+                                // Fire webhook notification only if not already pending (fire-and-forget)
                                 #[cfg(feature = "api")]
-                                if let Some(ref webhook_url) = approval_webhook {
+                                if !already_pending { if let Some(ref webhook_url) = approval_webhook {
                                     let url = webhook_url.clone();
                                     let svc = service_name.clone();
                                     let visitor = addr.to_string();
@@ -865,7 +868,7 @@ fn tcp_listen_and_send(
                                             warn!("Failed to send approval webhook: {}", e);
                                         }
                                     });
-                                }
+                                } }
 
                                 // Spawn a task to wait for approval
                                 let tx_clone = tx.clone();

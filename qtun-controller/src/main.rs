@@ -5,6 +5,7 @@ mod cleanup;
 mod config;
 mod db;
 mod dns;
+mod download;
 mod port;
 mod rathole;
 mod webhook;
@@ -40,6 +41,7 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Arc::new(cfg);
     let db = Arc::new(db::Db::new(&cfg.db_path)?);
     let rathole = Arc::new(rathole::RatholeClient::new(&cfg.rathole_api));
+    let dl_tokens = Arc::new(download::DownloadTokenStore::new());
 
     // DNS server in background
     {
@@ -69,6 +71,8 @@ async fn main() -> anyhow::Result<()> {
         let webhook_state = Arc::new(webhook::WebhookState {
             bot: teloxide::Bot::new(&cfg.telegram_bot_token),
             db: db.clone(),
+            agent_binaries_dir: cfg.agent_binaries_dir.clone(),
+            dl_tokens: dl_tokens.clone(),
         });
         let addr = webhook_addr.clone();
         tokio::spawn(async move {
@@ -80,7 +84,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Telegram bot (blocks until Ctrl-C)
-    bot::run_bot(db, rathole, cfg).await?;
+    bot::run_bot(db, rathole, cfg, dl_tokens).await?;
 
     Ok(())
 }

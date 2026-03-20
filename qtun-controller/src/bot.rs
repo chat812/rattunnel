@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use rand::Rng;
-use teloxide::{prelude::*, utils::command::BotCommands};
+use teloxide::{prelude::*, types::ParseMode, utils::command::BotCommands};
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::download::DownloadTokenStore;
 use crate::port::kill_listener;
 use crate::rathole::RatholeClient;
 
@@ -24,6 +25,8 @@ pub enum Cmd {
     List,
     #[command(description = "<name> — Kill a tunnel")]
     Kill(String),
+    #[command(description = "Show agent download links")]
+    Download,
 }
 
 fn escape_html(s: &str) -> String {
@@ -78,6 +81,41 @@ fn gen_setup_code() -> String {
     format!("{}-{}", part1, part2)
 }
 
+fn format_download_links(server_ip: &str, token: &str, binaries_dir: Option<&str>) -> String {
+    let base_url = format!("http://{}:8090/download/{}", server_ip, token);
+    let archs = [
+        ("x86_64", "x86_64 (64-bit Intel/AMD)"),
+        ("i686", "x86 (32-bit Intel/AMD)"),
+        ("aarch64", "ARM64 (aarch64)"),
+        ("armv7", "ARM32 (armv7/armhf)"),
+    ];
+
+    let mut lines = Vec::new();
+    for (arch, label) in &archs {
+        let available = binaries_dir
+            .map(|d| std::path::Path::new(d).join(arch).exists())
+            .unwrap_or(false);
+        if available {
+            lines.push(format!(
+                "\u{2705} <b>{}</b>\n<code>curl -sSL {}/{} -o rathole &amp;&amp; chmod +x rathole</code>",
+                label, base_url, arch,
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        "No agent binaries available. Run <code>./build.sh</code> on the server first.".to_string()
+    } else {
+        format!(
+            "\u{1f4e6} <b>Agent Download Links</b>\n\n{}\n\n\
+             \u{1f680} <b>Quick install (auto-detect arch):</b>\n\
+             <code>curl -sSL {}/$(uname -m) -o rathole &amp;&amp; chmod +x rathole</code>",
+            lines.join("\n\n"),
+            base_url,
+        )
+    }
+}
+
 async fn answer(
     bot: Bot,
     msg: Message,
@@ -85,6 +123,7 @@ async fn answer(
     db: Arc<Db>,
     rathole: Arc<RatholeClient>,
     cfg: Arc<Config>,
+    dl_tokens: Arc<DownloadTokenStore>,
 ) -> ResponseResult<()> {
     match cmd {
         Cmd::Register(args) => {
@@ -463,6 +502,27 @@ async fn answer(
                 }
             }
         }
+
+        Cmd::Download => {
+            let (token, remaining) = if let Some(active) = dl_tokens.find_active(msg.chat.id.0) {
+                active
+            } else {
+                let token = dl_tokens.create(msg.chat.id.0);
+                (token, 600)
+            };
+
+            let mins = remaining / 60;
+            let secs = remaining % 60;
+            let text = format_download_links(&cfg.server_ip, &token, cfg.agent_binaries_dir.as_deref());
+            let text = format!(
+                "{}\n\n\u{23f3} <b>Expires in:</b> {}m {}s\n\
+                 \u{1f512} Each new IP will require your approval before downloading.",
+                text, mins, secs,
+            );
+            bot.send_message(msg.chat.id, text)
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .await?;
+        }
     }
 
     Ok(())
@@ -472,6 +532,8 @@ async fn handle_callback(
     bot: Bot,
     q: CallbackQuery,
     rathole: Arc<RatholeClient>,
+    _cfg: Arc<Config>,
+    dl_tokens: Arc<DownloadTokenStore>,
 ) -> ResponseResult<()> {
     let data = match q.data {
         Some(d) => d,
@@ -483,41 +545,80 @@ async fn handle_callback(
         None => return Ok(()),
     };
 
-    let result = match action {
-        "approve" => rathole.approve_connection(id).await,
-        "deny" => rathole.deny_connection(id).await,
-        _ => return Ok(()),
-    };
+    match action {
+        "approve" | "deny" => {
+            let result = match action {
+                "approve" => rathole.approve_connection(id).await,
+                _ => rathole.deny_connection(id).await,
+            };
 
-    // Answer the callback query (removes loading spinner)
-    let answer_text = match &result {
-        Ok(()) if action == "approve" => "Connection approved",
-        Ok(()) => "Connection denied",
-        Err(_) => "Failed (connection may have timed out)",
-    };
-    let _ = bot.answer_callback_query(&q.id).text(answer_text).await;
+            let answer_text = match &result {
+                Ok(()) if action == "approve" => "Connection approved",
+                Ok(()) => "Connection denied",
+                Err(_) => "Failed (connection may have timed out)",
+            };
+            let _ = bot.answer_callback_query(&q.id).text(answer_text).await;
 
-    // Edit the original message to show the decision
-    if let Some(msg) = q.message {
-        let orig_text = msg.text().unwrap_or("");
-        let status = if result.is_ok() {
-            if action == "approve" { "APPROVED" } else { "DENIED" }
-        } else {
-            "EXPIRED"
-        };
-        let new_text = format!(
-            "{}\n\n<b>Status:</b> {}",
-            escape_html(orig_text),
-            status
-        );
-        let _ = bot
-            .edit_message_text(msg.chat.id, msg.id, new_text)
-            .parse_mode(teloxide::types::ParseMode::Html)
-            .await;
-        // Remove the inline keyboard
-        let _ = bot
-            .edit_message_reply_markup(msg.chat.id, msg.id)
-            .await;
+            if let Some(msg) = q.message {
+                let orig_text = msg.text().unwrap_or("");
+                let status = if result.is_ok() {
+                    if action == "approve" { "APPROVED" } else { "DENIED" }
+                } else {
+                    "EXPIRED"
+                };
+                let new_text = format!(
+                    "{}\n\n<b>Status:</b> {}",
+                    escape_html(orig_text),
+                    status
+                );
+                let _ = bot
+                    .edit_message_text(msg.chat.id, msg.id, new_text)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                let _ = bot
+                    .edit_message_reply_markup(msg.chat.id, msg.id)
+                    .await;
+            }
+        }
+
+        "dl_approve" | "dl_deny" => {
+            // id format: "token:ip"
+            let (token, ip_str) = match id.split_once(':') {
+                Some(pair) => pair,
+                None => return Ok(()),
+            };
+            let ip: std::net::IpAddr = match ip_str.parse() {
+                Ok(ip) => ip,
+                Err(_) => return Ok(()),
+            };
+
+            if action == "dl_approve" {
+                dl_tokens.approve_ip(token, ip);
+                let _ = bot.answer_callback_query(&q.id).text("Download approved").await;
+            } else {
+                dl_tokens.deny_ip(token, ip);
+                let _ = bot.answer_callback_query(&q.id).text("Download denied").await;
+            }
+
+            if let Some(msg) = q.message {
+                let orig_text = msg.text().unwrap_or("");
+                let status = if action == "dl_approve" { "APPROVED" } else { "DENIED" };
+                let new_text = format!(
+                    "{}\n\n<b>Status:</b> {}",
+                    escape_html(orig_text),
+                    status,
+                );
+                let _ = bot
+                    .edit_message_text(msg.chat.id, msg.id, new_text)
+                    .parse_mode(ParseMode::Html)
+                    .await;
+                let _ = bot
+                    .edit_message_reply_markup(msg.chat.id, msg.id)
+                    .await;
+            }
+        }
+
+        _ => {}
     }
 
     Ok(())
@@ -527,6 +628,7 @@ pub async fn run_bot(
     db: Arc<Db>,
     rathole: Arc<RatholeClient>,
     cfg: Arc<Config>,
+    dl_tokens: Arc<DownloadTokenStore>,
 ) -> anyhow::Result<()> {
     let bot = Bot::new(&cfg.telegram_bot_token);
 
@@ -544,7 +646,7 @@ pub async fn run_bot(
         .branch(callback_handler);
 
     Dispatcher::builder(bot, handler)
-        .dependencies(dptree::deps![db, rathole, cfg])
+        .dependencies(dptree::deps![db, rathole, cfg, dl_tokens])
         .enable_ctrlc_handler()
         .build()
         .dispatch()

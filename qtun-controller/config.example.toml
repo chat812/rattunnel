@@ -11,3 +11,4 @@ port_max           = 14000
 log_level          = "info"
 idle_timeout_secs  = 3600  # remove tunnel after 1 hour of inactivity
 webhook_listen_addr = "0.0.0.0:8090"
+agent_binaries_dir  = "/app/agents"   # directory with pre-built agent binaries (one per arch)

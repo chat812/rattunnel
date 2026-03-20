@@ -15,6 +15,8 @@ pub struct Config {
     pub idle_timeout_secs: u64,
     /// Address for the webhook HTTP server (e.g. "0.0.0.0:8090")
     pub webhook_listen_addr: Option<String>,
+    /// Directory containing pre-built agent binaries for download (one per arch)
+    pub agent_binaries_dir: Option<String>,
 }
 
 impl Config {

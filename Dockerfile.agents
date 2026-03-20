@@ -1,0 +1,58 @@
+# Cross-compile rathole-agent for all supported architectures.
+# Produces static musl binaries for: x86_64, i686, aarch64, armv7.
+#
+# Usage:
+#   docker build -f Dockerfile.agents --target export --output type=local,dest=./build/agents .
+
+FROM rust:1-bookworm AS builder
+
+# Install musl cross-compilers for all targets
+RUN apt-get update && apt-get install -y \
+        musl-tools \
+        gcc-x86-64-linux-gnu \
+        gcc-i686-linux-gnu \
+        gcc-aarch64-linux-gnu \
+        gcc-arm-linux-gnueabihf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install all musl targets
+RUN rustup target add \
+        x86_64-unknown-linux-musl \
+        i686-unknown-linux-musl \
+        aarch64-unknown-linux-musl \
+        armv7-unknown-linux-musleabihf
+
+# Configure linkers for cross-compilation
+RUN mkdir -p /.cargo && printf '\
+[target.x86_64-unknown-linux-musl]\nlinker = "x86_64-linux-gnu-gcc"\n\n\
+[target.i686-unknown-linux-musl]\nlinker = "i686-linux-gnu-gcc"\n\n\
+[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n\n\
+[target.armv7-unknown-linux-musleabihf]\nlinker = "arm-linux-gnueabihf-gcc"\n' \
+    > /.cargo/config.toml
+
+WORKDIR /src/rathole
+COPY rathole/ .
+RUN rm -f rust-toolchain rust-toolchain.toml
+
+# Common cargo flags for agent build
+ENV AGENT_FEATURES="client,rustls,noise,websocket-rustls"
+
+RUN cargo build --release --target x86_64-unknown-linux-musl \
+        --no-default-features --features "$AGENT_FEATURES"
+
+RUN cargo build --release --target i686-unknown-linux-musl \
+        --no-default-features --features "$AGENT_FEATURES"
+
+RUN cargo build --release --target aarch64-unknown-linux-musl \
+        --no-default-features --features "$AGENT_FEATURES"
+
+RUN cargo build --release --target armv7-unknown-linux-musleabihf \
+        --no-default-features --features "$AGENT_FEATURES"
+
+# -----------------------------------------------------------
+FROM scratch AS export
+
+COPY --from=builder /src/rathole/target/x86_64-unknown-linux-musl/release/rathole       /x86_64
+COPY --from=builder /src/rathole/target/i686-unknown-linux-musl/release/rathole          /i686
+COPY --from=builder /src/rathole/target/aarch64-unknown-linux-musl/release/rathole       /aarch64
+COPY --from=builder /src/rathole/target/armv7-unknown-linux-musleabihf/release/rathole   /armv7

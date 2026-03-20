@@ -6,6 +6,7 @@
 #   - rathole server (dynamic, default features + api) — for Docker
 #   - rathole agent  (static, client-only with rustls) — for distribution
 #   - qtun-controller (static) — for Docker/distribution
+#   - rathole agent for all architectures (x86_64, i686, aarch64, armv7) → ./build/agents/
 #
 # Usage: ./build.sh [platform]
 #   e.g.  ./build.sh                     # native arch
@@ -43,7 +44,16 @@ docker build -f Dockerfile.build "${PLATFORM_FLAG[@]}" \
     --target export --output "type=local,dest=$BUILD_DIR" . \
     || fail "Docker build failed"
 
-ok "All binaries built"
+ok "Server/controller binaries built"
+
+# ---------- Multi-arch agent binaries ----------
+info "Building rathole-agent for all architectures (x86_64, i686, aarch64, armv7)..."
+
+docker build -f Dockerfile.agents \
+    --target export --output "type=local,dest=$BUILD_DIR/agents" . \
+    || fail "Multi-arch agent build failed"
+
+ok "All agent binaries built"
 
 # ---------- Summary ----------
 echo ""
@@ -57,6 +67,15 @@ for bin in rathole-server rathole-agent qtun-controller; do
     if [ -f "$BUILD_DIR/$bin" ]; then
         size=$(du -h "$BUILD_DIR/$bin" | cut -f1)
         echo -e "    ${CYAN}$bin${NC}  ($size)"
+    fi
+done
+echo ""
+echo "  Agent binaries (all archs) in $BUILD_DIR/agents:"
+echo ""
+for arch in x86_64 i686 aarch64 armv7; do
+    if [ -f "$BUILD_DIR/agents/$arch" ]; then
+        size=$(du -h "$BUILD_DIR/agents/$arch" | cut -f1)
+        echo -e "    ${CYAN}rathole-agent-$arch${NC}  ($size)"
     fi
 done
 echo ""

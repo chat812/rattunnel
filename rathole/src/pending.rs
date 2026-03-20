@@ -26,6 +26,19 @@ pub fn new_pending_map() -> PendingMap {
     Arc::new(RwLock::new(HashMap::new()))
 }
 
+/// Check if there is already a pending connection for this service + IP.
+pub async fn is_pending(map: &PendingMap, service_name: &str, ip: IpAddr) -> bool {
+    let m = map.read().await;
+    m.values().any(|c| {
+        c.info.service_name == service_name
+            && c.info
+                .visitor_addr
+                .parse::<std::net::SocketAddr>()
+                .map(|a| a.ip() == ip)
+                .unwrap_or(false)
+    })
+}
+
 /// Insert a new pending connection. Returns (id, receiver).
 pub async fn insert(
     map: &PendingMap,
