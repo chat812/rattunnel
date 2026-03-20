@@ -7,6 +7,10 @@
 #   - rathole agent  (static, client-only with rustls) — for distribution
 #   - qtun-controller (static) — for Docker/distribution
 #
+# Usage: ./build.sh [platform]
+#   e.g.  ./build.sh                     # native arch
+#         ./build.sh linux/amd64         # x86_64
+#         ./build.sh linux/arm64         # aarch64
 
 set -euo pipefail
 
@@ -22,12 +26,21 @@ info()  { echo -e "${CYAN}[*]${NC} $1"; }
 ok()    { echo -e "${GREEN}[+]${NC} $1"; }
 fail()  { echo -e "${RED}[-]${NC} $1"; exit 1; }
 
+PLATFORM="${1:-}"
+
 mkdir -p "$BUILD_DIR"
 
 info "Building all binaries in Docker..."
 cd "$SCRIPT_DIR"
 
-docker build -f Dockerfile.build --target export --output "type=local,dest=$BUILD_DIR" . \
+PLATFORM_FLAG=()
+if [ -n "$PLATFORM" ]; then
+    PLATFORM_FLAG=(--platform "$PLATFORM")
+    info "Target platform: $PLATFORM"
+fi
+
+docker build -f Dockerfile.build "${PLATFORM_FLAG[@]}" \
+    --target export --output "type=local,dest=$BUILD_DIR" . \
     || fail "Docker build failed"
 
 ok "All binaries built"

@@ -1,6 +1,15 @@
-FROM rust:1-bookworm AS rathole-builder
+ARG RUST_MUSL_TARGET
 
-RUN rustup target add aarch64-unknown-linux-musl \
+FROM rust:1-bookworm AS rathole-builder
+ARG TARGETARCH
+ARG RUST_MUSL_TARGET
+
+RUN case "$TARGETARCH" in \
+        amd64) MUSL_TARGET=x86_64-unknown-linux-musl ;; \
+        arm64) MUSL_TARGET=aarch64-unknown-linux-musl ;; \
+        *) echo "Unsupported arch: $TARGETARCH" && exit 1 ;; \
+    esac \
+    && rustup target add "$MUSL_TARGET" \
     && apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src/rathole
@@ -11,24 +20,40 @@ RUN rm -f rust-toolchain rust-toolchain.toml
 RUN cargo build --release
 
 # agent: static, client-only + rustls
-RUN cargo build --release \
-    --target aarch64-unknown-linux-musl \
-    --no-default-features \
-    --features "client,rustls,noise,websocket-rustls"
+RUN case "$TARGETARCH" in \
+        amd64) MUSL_TARGET=x86_64-unknown-linux-musl ;; \
+        arm64) MUSL_TARGET=aarch64-unknown-linux-musl ;; \
+    esac \
+    && cargo build --release \
+        --target "$MUSL_TARGET" \
+        --no-default-features \
+        --features "client,rustls,noise,websocket-rustls"
 
 # -----------------------------------------------------------
 FROM rust:slim-bookworm AS qtun-builder
+ARG TARGETARCH
 
-RUN apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/* \
-    && rustup target add aarch64-unknown-linux-musl
+RUN case "$TARGETARCH" in \
+        amd64) MUSL_TARGET=x86_64-unknown-linux-musl ;; \
+        arm64) MUSL_TARGET=aarch64-unknown-linux-musl ;; \
+        *) echo "Unsupported arch: $TARGETARCH" && exit 1 ;; \
+    esac \
+    && apt-get update && apt-get install -y musl-tools && rm -rf /var/lib/apt/lists/* \
+    && rustup target add "$MUSL_TARGET"
 
 WORKDIR /src/qtun-controller
 COPY qtun-controller/ .
 
-RUN cargo build --release --target aarch64-unknown-linux-musl
+RUN case "$TARGETARCH" in \
+        amd64) MUSL_TARGET=x86_64-unknown-linux-musl ;; \
+        arm64) MUSL_TARGET=aarch64-unknown-linux-musl ;; \
+    esac \
+    && cargo build --release --target "$MUSL_TARGET"
 
 # -----------------------------------------------------------
 FROM scratch AS export
-COPY --from=rathole-builder /src/rathole/target/release/rathole                              /rathole-server
-COPY --from=rathole-builder /src/rathole/target/aarch64-unknown-linux-musl/release/rathole   /rathole-agent
-COPY --from=qtun-builder    /src/qtun-controller/target/aarch64-unknown-linux-musl/release/qtun-controller /qtun-controller
+ARG TARGETARCH
+
+COPY --from=rathole-builder /src/rathole/target/release/rathole /rathole-server
+COPY --from=rathole-builder /src/rathole/target/*-unknown-linux-musl/release/rathole /rathole-agent
+COPY --from=qtun-builder /src/qtun-controller/target/*-unknown-linux-musl/release/qtun-controller /qtun-controller
