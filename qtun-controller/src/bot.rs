@@ -81,8 +81,8 @@ fn gen_setup_code() -> String {
     format!("{}-{}", part1, part2)
 }
 
-fn format_download_links(server_ip: &str, token: &str, binaries_dir: Option<&str>) -> String {
-    let base_url = format!("http://{}:8090/download/{}", server_ip, token);
+fn format_download_links(domain: &str, token: &str, binaries_dir: Option<&str>) -> String {
+    let base_url = format!("http://{}.{}:8090", token, domain);
     let archs = [
         ("x86_64", "x86_64 (64-bit Intel/AMD)"),
         ("i686", "x86 (32-bit Intel/AMD)"),
@@ -513,7 +513,7 @@ async fn answer(
 
             let mins = remaining / 60;
             let secs = remaining % 60;
-            let text = format_download_links(&cfg.server_ip, &token, cfg.agent_binaries_dir.as_deref());
+            let text = format_download_links(&cfg.domain, &token, cfg.agent_binaries_dir.as_deref());
             let text = format!(
                 "{}\n\n\u{23f3} <b>Expires in:</b> {}m {}s\n\
                  \u{1f512} Each new IP will require your approval before downloading.",

@@ -1,6 +1,6 @@
 use axum::{
     extract::{ConnectInfo, Path, State},
-    http::{StatusCode, header},
+    http::{StatusCode, HeaderMap, header},
     response::IntoResponse,
     Json, Router,
     routing::{get, post},
@@ -26,6 +26,7 @@ pub struct WebhookState {
     pub db: Arc<Db>,
     pub agent_binaries_dir: Option<String>,
     pub dl_tokens: Arc<DownloadTokenStore>,
+    pub domain: String,
 }
 
 fn escape_html(s: &str) -> String {
@@ -90,6 +91,24 @@ fn resolve_arch(arch: &str) -> Option<&'static str> {
     }
 }
 
+/// Extract the download token from the Host header subdomain.
+/// e.g. Host: "a1b2c3d4.tun.example.com:8090" with domain "tun.example.com"
+///      → Some("a1b2c3d4")
+fn extract_token_from_host(headers: &HeaderMap, domain: &str) -> Option<String> {
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    // Strip port if present
+    let host_no_port = host.split(':').next().unwrap_or(host);
+    // Expect "{token}.{domain}"
+    let suffix = format!(".{}", domain);
+    if host_no_port.ends_with(&suffix) {
+        let token = &host_no_port[..host_no_port.len() - suffix.len()];
+        if !token.is_empty() && !token.contains('.') {
+            return Some(token.to_string());
+        }
+    }
+    None
+}
+
 async fn serve_binary(state: &WebhookState, arch: &str) -> Result<([(header::HeaderName, String); 2], Vec<u8>), StatusCode> {
     let dir = state.agent_binaries_dir.as_deref().ok_or(StatusCode::NOT_FOUND)?;
     let filename = resolve_arch(arch).ok_or(StatusCode::BAD_REQUEST)?;
@@ -105,8 +124,14 @@ async fn serve_binary(state: &WebhookState, arch: &str) -> Result<([(header::Hea
 async fn handle_download(
     State(state): State<Arc<WebhookState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    Path((token, arch)): Path<(String, String)>,
+    headers: HeaderMap,
+    Path(arch): Path<String>,
 ) -> impl IntoResponse {
+    let token = match extract_token_from_host(&headers, &state.domain) {
+        Some(t) => t,
+        None => return Err(StatusCode::BAD_REQUEST),
+    };
+
     let ip = addr.ip();
 
     match state.dl_tokens.check_access(&token, ip) {
@@ -114,7 +139,6 @@ async fn handle_download(
             serve_binary(&state, &arch).await
         }
         AccessResult::NeedApproval(chat_id) => {
-            // Send Telegram approval prompt
             let keyboard = InlineKeyboardMarkup::new(vec![vec![
                 InlineKeyboardButton::callback(
                     "\u{2705} Approve",
@@ -142,7 +166,6 @@ async fn handle_download(
             Err(StatusCode::FORBIDDEN)
         }
         AccessResult::Pending => {
-            // Already prompted, waiting for approval
             Err(StatusCode::FORBIDDEN)
         }
         AccessResult::Denied => {
@@ -157,7 +180,7 @@ pub async fn run_webhook_server(
 ) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/webhook/connection", post(handle_webhook))
-        .route("/download/:token/:arch", get(handle_download));
+        .route("/:arch", get(handle_download));
 
     let listener = tokio::net::TcpListener::bind(bind_addr).await?;
     log::info!("Webhook server listening at {}", bind_addr);

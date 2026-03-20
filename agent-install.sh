@@ -7,11 +7,11 @@
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/chat812/rattunnel/main/agent-install.sh | bash
 #   or:
-#   ./agent-install.sh [SERVER_API_ADDR]
+#   ./agent-install.sh [DOMAIN] [DOWNLOAD_TOKEN]
 #
 # Examples:
-#   ./agent-install.sh                    # prompts for server address
-#   ./agent-install.sh 1.2.3.4:9090      # uses provided address
+#   ./agent-install.sh                              # prompts for domain and token
+#   ./agent-install.sh tun.example.com abc123       # uses provided values
 
 set -euo pipefail
 
@@ -38,15 +38,15 @@ if [ "$(id -u)" -ne 0 ]; then
     err "This script must be run as root (use sudo)"
 fi
 
-# --- Get server address ---
-SERVER_API_ADDR="${1:-}"
-if [ -z "$SERVER_API_ADDR" ]; then
-    echo -ne "${CYAN}Enter server API address (e.g. 1.2.3.4:9090): ${NC}"
-    read -r SERVER_API_ADDR
+# --- Get server domain ---
+SERVER_DOMAIN="${1:-}"
+if [ -z "$SERVER_DOMAIN" ]; then
+    echo -ne "${CYAN}Enter server domain (e.g. tun.example.com): ${NC}"
+    read -r SERVER_DOMAIN
 fi
-[ -z "$SERVER_API_ADDR" ] && err "Server address is required"
+[ -z "$SERVER_DOMAIN" ] && err "Server domain is required"
 
-info "Server API: $SERVER_API_ADDR"
+info "Server domain: $SERVER_DOMAIN"
 
 # --- Detect architecture ---
 detect_arch() {
@@ -74,8 +74,10 @@ fi
 [ -z "$DOWNLOAD_TOKEN" ] && err "Download token is required"
 
 # --- Download pre-built binary ---
-DOWNLOAD_URL="http://$SERVER_API_ADDR/download/$DOWNLOAD_TOKEN/$ARCH"
-info "Downloading rathole-agent from server..."
+# SERVER_API_ADDR is used as the domain (e.g. tun.example.com)
+# The token becomes a subdomain: http://{token}.{domain}:8090/{arch}
+DOWNLOAD_URL="http://$DOWNLOAD_TOKEN.$SERVER_DOMAIN:8090/$ARCH"
+info "Downloading rathole-agent from $DOWNLOAD_URL ..."
 
 TMPDIR=$(mktemp -d)
 BINARY="$TMPDIR/rathole"
@@ -113,7 +115,7 @@ if [ ! -f "$CONFIG_FILE" ]; then
     [ -z "$SETUP_CODE" ] && err "Setup code is required"
 
     info "Fetching config from server..."
-    RESPONSE=$(curl -sf "http://$SERVER_API_ADDR/api/v1/setup/$SETUP_CODE" 2>/dev/null) || \
+    RESPONSE=$(curl -sf "http://$SERVER_DOMAIN:9090/api/v1/setup/$SETUP_CODE" 2>/dev/null) || \
         err "Setup code invalid, expired, or server unreachable"
 
     # Parse JSON response

@@ -45,10 +45,9 @@ async fn main() -> anyhow::Result<()> {
 
     // DNS server in background
     {
-        let dns_db = db.clone();
         let dns_cfg = cfg.clone();
         tokio::spawn(async move {
-            if let Err(e) = dns::run_dns_server(dns_db, dns_cfg).await {
+            if let Err(e) = dns::run_dns_server(dns_cfg).await {
                 log::error!("DNS server stopped: {}", e);
             }
         });
@@ -73,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
             db: db.clone(),
             agent_binaries_dir: cfg.agent_binaries_dir.clone(),
             dl_tokens: dl_tokens.clone(),
+            domain: cfg.domain.clone(),
         });
         let addr = webhook_addr.clone();
         tokio::spawn(async move {

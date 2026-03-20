@@ -3,7 +3,6 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 
 use crate::config::Config;
-use crate::db::Db;
 
 /// Parse a DNS name from a packet buffer starting at `offset`.
 /// Handles label compression (pointers).
@@ -139,7 +138,7 @@ fn refused_response(query: &[u8]) -> Vec<u8> {
     resp
 }
 
-fn handle_query(buf: &[u8], db: &Db, server_ip: &[u8; 4], domain: &str) -> Vec<u8> {
+fn handle_query(buf: &[u8], server_ip: &[u8; 4], domain: &str) -> Vec<u8> {
     if buf.len() < 12 {
         return vec![];
     }
@@ -172,16 +171,11 @@ fn handle_query(buf: &[u8], db: &Db, server_ip: &[u8; 4], domain: &str) -> Vec<u
         return build_a_response(buf, None);
     }
 
-    // A query — look up DB
-    let exists = db.subdomain_exists(&name).unwrap_or(false);
-    if exists {
-        build_a_response(buf, Some(*server_ip))
-    } else {
-        build_a_response(buf, None)
-    }
+    // Wildcard: resolve all subdomains in our zone to server_ip
+    build_a_response(buf, Some(*server_ip))
 }
 
-pub async fn run_dns_server(db: Arc<Db>, cfg: Arc<Config>) -> Result<()> {
+pub async fn run_dns_server(cfg: Arc<Config>) -> Result<()> {
     let octets: Vec<u8> = cfg.server_ip
         .split('.')
         .filter_map(|s| s.parse().ok())
@@ -205,7 +199,7 @@ pub async fn run_dns_server(db: Arc<Db>, cfg: Arc<Config>) -> Result<()> {
         };
 
         let packet = buf[..len].to_vec();
-        let resp = handle_query(&packet, &db, &server_ip, &cfg.domain);
+        let resp = handle_query(&packet, &server_ip, &cfg.domain);
         if !resp.is_empty() {
             if let Err(e) = socket.send_to(&resp, peer).await {
                 log::warn!("DNS send error: {}", e);
