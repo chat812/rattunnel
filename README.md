@@ -74,7 +74,13 @@ Then enter the setup code when prompted.
 
 ### 4. Set up the agent client
 
-On your machine:
+**Option A — One-liner install (builds from source, installs as service):**
+
+```bash
+sudo bash -c "$(curl -sSL https://raw.githubusercontent.com/chat812/rattunnel/main/agent-install.sh)" -- your-server-ip:9090
+```
+
+**Option B — Manual:**
 
 ```bash
 ./rathole --setup your-server-ip:9090
