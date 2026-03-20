@@ -1,0 +1,13 @@
+# QuickTun Controller configuration
+# Copy this to config.toml and fill in your values
+
+telegram_bot_token = "YOUR_TELEGRAM_BOT_TOKEN"
+server_ip          = "1.2.3.4"
+domain             = "tun.yourdomain.com"
+rathole_api        = "http://127.0.0.1:9090"
+db_path            = "tunnels.db"
+port_min           = 10000
+port_max           = 14000
+log_level          = "info"
+idle_timeout_secs  = 3600  # remove tunnel after 1 hour of inactivity
+webhook_listen_addr = "0.0.0.0:8090"

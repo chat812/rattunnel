@@ -1,0 +1,26 @@
+# Build artifacts
+**/target/
+**/*.rs.bk
+
+# Config files with secrets
+rathole/run/server.toml
+qtun-controller/config.toml
+qtun-controller/.env
+
+# Runtime data
+*.db
+*.db-journal
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Binary
+rathole/rathole
+qtun-controller/qtun-controller

@@ -1,0 +1,1019 @@
+use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
+use crate::config_watcher::{ConfigChange, ServerServiceChange};
+use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::helper::{retry_notify_with_deadline, write_and_flush};
+use crate::multi_map::MultiMap;
+use crate::pending::{self, ApprovedMap, PendingMap};
+use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
+use crate::protocol::{
+    self, read_auth, read_hello, write_control_cmd, Ack, ControlChannelCmd, DataChannelCmd, Hello,
+    ServicePushConfig, UdpTraffic, GATEWAY_SERVICE_NAME, HASH_WIDTH_IN_BYTES,
+};
+use crate::registry::{RegistryGuard, ServiceRegistry};
+use crate::transport::{SocketOpts, TcpTransport, Transport};
+use anyhow::{anyhow, bail, Context, Result};
+use backoff::backoff::Backoff;
+use backoff::ExponentialBackoff;
+
+use rand::RngCore;
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::time;
+use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
+
+#[cfg(feature = "noise")]
+use crate::transport::NoiseTransport;
+#[cfg(any(feature = "native-tls", feature = "rustls"))]
+use crate::transport::TlsTransport;
+#[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+use crate::transport::WebsocketTransport;
+
+type ServiceDigest = protocol::Digest; // SHA256 of a service name
+type Nonce = protocol::Digest; // Also called `session_key`
+
+const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
+const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
+const CHAN_SIZE: usize = 2048; // The capacity of various chans
+const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+
+// The entrypoint of running a server
+pub async fn run_server(
+    config: Config,
+    shutdown_rx: broadcast::Receiver<bool>,
+    update_rx: mpsc::Receiver<ConfigChange>,
+    registry: Arc<ServiceRegistry>,
+    pending_map: PendingMap,
+    approved_map: ApprovedMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
+) -> Result<()> {
+    let config = match config.server {
+            Some(config) => config,
+            None => {
+                return Err(anyhow!("Try to run as a server, but the configuration is missing. Please add the `[server]` block"))
+            }
+        };
+
+    match config.transport.transport_type {
+        TransportType::Tcp => {
+            let mut server = Server::<TcpTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
+            server.run(shutdown_rx, update_rx).await?;
+        }
+        TransportType::Tls => {
+            #[cfg(any(feature = "native-tls", feature = "rustls"))]
+            {
+                let mut server = Server::<TlsTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
+                server.run(shutdown_rx, update_rx).await?;
+            }
+            #[cfg(not(any(feature = "native-tls", feature = "rustls")))]
+            crate::helper::feature_neither_compile("native-tls", "rustls")
+        }
+        TransportType::Noise => {
+            #[cfg(feature = "noise")]
+            {
+                let mut server = Server::<NoiseTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
+                server.run(shutdown_rx, update_rx).await?;
+            }
+            #[cfg(not(feature = "noise"))]
+            crate::helper::feature_not_compile("noise")
+        }
+        TransportType::Websocket => {
+            #[cfg(any(feature = "websocket-native-tls", feature = "websocket-rustls"))]
+            {
+                let mut server = Server::<WebsocketTransport>::from(config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await?;
+                server.run(shutdown_rx, update_rx).await?;
+            }
+            #[cfg(not(any(feature = "websocket-native-tls", feature = "websocket-rustls")))]
+            crate::helper::feature_neither_compile("websocket-native-tls", "websocket-rustls")
+        }
+    }
+
+    Ok(())
+}
+
+// A hash map of ControlChannelHandles, indexed by ServiceDigest or Nonce
+// See also MultiMap
+type ControlChannelMap<T> = MultiMap<ServiceDigest, Nonce, ControlChannelHandle<T>>;
+
+// Server holds all states of running a server
+struct Server<T: Transport> {
+    // `[server]` config
+    config: Arc<ServerConfig>,
+
+    // `[server.services]` config, indexed by ServiceDigest
+    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    // Collection of control channels
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    // Wrapper around the transport layer
+    transport: Arc<T>,
+    // Service registry for tracking service state
+    registry: Arc<ServiceRegistry>,
+    // Pending connections awaiting approval
+    pending_map: PendingMap,
+    // Approved IPs per service
+    approved_map: ApprovedMap,
+    // Webhook URL for approval notifications
+    approval_webhook: Option<String>,
+    // Timeout in seconds for approval
+    approval_timeout: u64,
+}
+
+/// Determine whether a service should be pushed to a gateway channel.
+/// - Service with agent_id pushes only to the matching agent's gateway.
+/// - Service without agent_id (legacy) pushes to ALL gateways.
+fn should_push_to_gateway(
+    svc_agent_id: &Option<String>,
+    handle_agent_id: &Option<String>,
+) -> bool {
+    match (svc_agent_id, handle_agent_id) {
+        (Some(svc), Some(handle)) => svc == handle,
+        (None, _) => true, // Legacy service → push to all gateways
+        (Some(_), None) => false, // Agent-owned service → don't push to legacy gateway
+    }
+}
+
+// Generate a hash map of services which is indexed by ServiceDigest
+fn generate_service_hashmap(
+    server_config: &ServerConfig,
+) -> HashMap<ServiceDigest, ServerServiceConfig> {
+    let mut ret = HashMap::new();
+    for u in &server_config.services {
+        ret.insert(protocol::digest(u.0.as_bytes()), (*u.1).clone());
+    }
+    ret
+}
+
+impl<T: 'static + Transport> Server<T> {
+    // Create a server from `[server]`
+    pub async fn from(
+        config: ServerConfig,
+        registry: Arc<ServiceRegistry>,
+        pending_map: PendingMap,
+        approved_map: ApprovedMap,
+        approval_webhook: Option<String>,
+        approval_timeout: u64,
+    ) -> Result<Server<T>> {
+        // Register initial services
+        for (name, svc) in &config.services {
+            let svc_type = format!("{:?}", svc.service_type).to_lowercase();
+            registry
+                .register(name.clone(), svc.bind_addr.clone(), svc_type)
+                .await;
+        }
+
+        let config = Arc::new(config);
+        let mut services_map = generate_service_hashmap(&config);
+
+        // Register the gateway service so gateway clients can connect
+        if config.default_token.is_some() {
+            let gateway_cfg = ServerServiceConfig {
+                service_type: ServiceType::Tcp,
+                name: GATEWAY_SERVICE_NAME.to_string(),
+                bind_addr: String::new(), // No listener for gateway
+                token: config.default_token.clone(),
+                nodelay: None,
+                local_addr: None,
+                require_approval: false,
+                agent_id: None,
+            };
+            services_map.insert(protocol::gateway_digest(), gateway_cfg);
+        }
+
+        let services = Arc::new(RwLock::new(services_map));
+        let control_channels = Arc::new(RwLock::new(ControlChannelMap::new()));
+        let transport = Arc::new(T::new(&config.transport)?);
+        Ok(Server {
+            config,
+            services,
+            control_channels,
+            transport,
+            registry,
+            pending_map,
+            approved_map,
+            approval_webhook,
+            approval_timeout,
+        })
+    }
+
+    // The entry point of Server
+    pub async fn run(
+        &mut self,
+        mut shutdown_rx: broadcast::Receiver<bool>,
+        mut update_rx: mpsc::Receiver<ConfigChange>,
+    ) -> Result<()> {
+        // Listen at `server.bind_addr`
+        let l = self
+            .transport
+            .bind(&self.config.bind_addr)
+            .await
+            .with_context(|| "Failed to listen at `server.bind_addr`")?;
+        info!("Listening at {}", self.config.bind_addr);
+
+        // Retry at least every 100ms
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_millis(100),
+            max_elapsed_time: None,
+            ..Default::default()
+        };
+
+        // Wait for connections and shutdown signals
+        loop {
+            tokio::select! {
+                // Wait for incoming control and data channels
+                ret = self.transport.accept(&l) => {
+                    match ret {
+                        Err(err) => {
+                            // Detects whether it's an IO error
+                            if let Some(err) = err.downcast_ref::<io::Error>() {
+                                // If it is an IO error, then it's possibly an
+                                // EMFILE. So sleep for a while and retry
+                                // TODO: Only sleep for EMFILE, ENFILE, ENOMEM, ENOBUFS
+                                if let Some(d) = backoff.next_backoff() {
+                                    error!("Failed to accept: {:#}. Retry in {:?}...", err, d);
+                                    time::sleep(d).await;
+                                } else {
+                                    // This branch will never be executed according to the current retry policy
+                                    error!("Too many retries. Aborting...");
+                                    break;
+                                }
+                            }
+                            // If it's not an IO error, then it comes from
+                            // the transport layer, so just ignore it
+                        }
+                        Ok((conn, addr)) => {
+                            backoff.reset();
+
+                            // Do transport handshake with a timeout
+                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
+                                Ok(conn) => {
+                                    match conn.with_context(|| "Failed to do transport handshake") {
+                                        Ok(conn) => {
+                                            let services = self.services.clone();
+                                            let control_channels = self.control_channels.clone();
+                                            let server_config = self.config.clone();
+                                            let registry = self.registry.clone();
+                                            let pending_map = self.pending_map.clone();
+                                            let approved_map = self.approved_map.clone();
+                                            let approval_webhook = self.approval_webhook.clone();
+                                            let approval_timeout = self.approval_timeout;
+                                            tokio::spawn(async move {
+                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config, registry, pending_map, approved_map, approval_webhook, approval_timeout).await {
+                                                    error!("{:#}", err);
+                                                }
+                                            }.instrument(info_span!("connection", %addr)));
+                                        }, Err(e) => {
+                                            error!("{:#}", e);
+                                        }
+                                    }
+                                },
+                                Err(e) => {
+                                    error!("Transport handshake timeout: {}", e);
+                                }
+                            }
+                        }
+                    }
+                },
+                // Wait for the shutdown signal
+                _ = shutdown_rx.recv() => {
+                    info!("Shuting down gracefully...");
+                    break;
+                },
+                e = update_rx.recv() => {
+                    if let Some(e) = e {
+                        self.handle_hot_reload(e).await;
+                    }
+                }
+            }
+        }
+
+        info!("Shutdown");
+
+        Ok(())
+    }
+
+    async fn handle_hot_reload(&mut self, e: ConfigChange) {
+        match e {
+            ConfigChange::ServerChange(server_change) => match server_change {
+                ServerServiceChange::Add(cfg) => {
+                    let svc_type = format!("{:?}", cfg.service_type).to_lowercase();
+                    self.registry
+                        .register(cfg.name.clone(), cfg.bind_addr.clone(), svc_type)
+                        .await;
+
+                    // Build push config before moving cfg into the services map
+                    let push_cfg = ServicePushConfig {
+                        name: cfg.name.clone(),
+                        local_addr: cfg.local_addr.clone().unwrap_or_default(),
+                        service_type: cfg.service_type,
+                        token: cfg
+                            .token
+                            .as_ref()
+                            .map(|t| t.to_string())
+                            .unwrap_or_default(),
+                        nodelay: cfg.nodelay,
+                    };
+
+                    let hash = protocol::digest(cfg.name.as_bytes());
+                    let svc_agent_id = cfg.agent_id.clone();
+
+                    // Insert into services map first so clients can authenticate when they connect back
+                    {
+                        let mut wg = self.services.write().await;
+                        let _ = wg.insert(hash, cfg);
+                    }
+
+                    // Push AddService to matching gateway clients only
+                    let cmd = ControlChannelCmd::AddService(push_cfg);
+                    {
+                        let channels = self.control_channels.read().await;
+                        for handle in channels.values() {
+                            if !protocol::is_gateway_service(&handle.service.name) {
+                                continue;
+                            }
+                            if should_push_to_gateway(&svc_agent_id, &handle.agent_id) {
+                                let _ = handle.cmd_tx.send(cmd.clone());
+                            }
+                        }
+                    }
+
+                    let mut wg = self.control_channels.write().await;
+                    let _ = wg.remove1(&hash);
+                }
+                ServerServiceChange::Delete(s) => {
+                    self.registry.unregister(&s).await;
+
+                    // Clear approved IPs for this service
+                    pending::clear_approved(&self.approved_map, &s).await;
+
+                    // Look up agent_id before removing
+                    let hash = protocol::digest(s.as_bytes());
+                    let svc_agent_id = self.services.read().await.get(&hash)
+                        .and_then(|svc| svc.agent_id.clone());
+
+                    // Push RemoveService to matching gateway clients only
+                    let cmd = ControlChannelCmd::RemoveService(s.clone());
+                    {
+                        let channels = self.control_channels.read().await;
+                        for handle in channels.values() {
+                            if !protocol::is_gateway_service(&handle.service.name) {
+                                continue;
+                            }
+                            if should_push_to_gateway(&svc_agent_id, &handle.agent_id) {
+                                let _ = handle.cmd_tx.send(cmd.clone());
+                            }
+                        }
+                    }
+
+                    let _ = self.services.write().await.remove(&hash);
+
+                    let mut wg = self.control_channels.write().await;
+                    let _ = wg.remove1(&hash);
+                }
+            },
+            ignored => warn!("Ignored {:?} since running as a server", ignored),
+        }
+    }
+}
+
+// Handle connections to `server.bind_addr`
+async fn handle_connection<T: 'static + Transport>(
+    mut conn: T::Stream,
+    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    server_config: Arc<ServerConfig>,
+    registry: Arc<ServiceRegistry>,
+    pending_map: PendingMap,
+    approved_map: ApprovedMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
+) -> Result<()> {
+    // Read hello
+    let hello = read_hello(&mut conn).await?;
+    match hello {
+        ControlChannelHello(_, service_digest) => {
+            do_control_channel_handshake(
+                conn,
+                services,
+                control_channels,
+                service_digest,
+                server_config,
+                registry,
+                pending_map,
+                approved_map,
+                approval_webhook,
+                approval_timeout,
+            )
+            .await?;
+        }
+        DataChannelHello(_, nonce) => {
+            do_data_channel_handshake(conn, control_channels, nonce).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn do_control_channel_handshake<T: 'static + Transport>(
+    mut conn: T::Stream,
+    services: Arc<RwLock<HashMap<ServiceDigest, ServerServiceConfig>>>,
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    service_digest: ServiceDigest,
+    server_config: Arc<ServerConfig>,
+    registry: Arc<ServiceRegistry>,
+    pending_map: PendingMap,
+    approved_map: ApprovedMap,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
+) -> Result<()> {
+    info!("Try to handshake a control channel");
+
+    T::hint(&conn, SocketOpts::for_control_channel());
+
+    // Generate a nonce
+    let mut nonce = vec![0u8; HASH_WIDTH_IN_BYTES];
+    rand::thread_rng().fill_bytes(&mut nonce);
+
+    // Send hello
+    let hello_send = Hello::ControlChannelHello(
+        protocol::CURRENT_PROTO_VERSION,
+        nonce.clone().try_into().unwrap(),
+    );
+    conn.write_all(&bincode::serialize(&hello_send).unwrap())
+        .await?;
+    conn.flush().await?;
+
+    // Lookup the service
+    let service_config = match services.read().await.get(&service_digest) {
+        Some(v) => v,
+        None => {
+            conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
+                .await?;
+            bail!("No such a service {}", hex::encode(service_digest));
+        }
+    }
+    .to_owned();
+
+    let service_name = &service_config.name;
+
+    // Calculate the checksum
+    let mut concat = Vec::from(service_config.token.as_ref().unwrap().as_bytes());
+    concat.append(&mut nonce);
+
+    // Read auth
+    let protocol::Auth(d) = read_auth(&mut conn).await?;
+
+    // Validate
+    let session_key = protocol::digest(&concat);
+    if session_key != d {
+        conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
+            .await?;
+        debug!(
+            "Expect {}, but got {}",
+            hex::encode(session_key),
+            hex::encode(d)
+        );
+        bail!("Service {} failed the authentication", service_name);
+    } else {
+        let mut h = control_channels.write().await;
+
+        // If there's already a control channel for the service, then drop the old one.
+        // Because a control channel doesn't report back when it's dead,
+        // the handle in the map could be stall, dropping the old handle enables
+        // the client to reconnect.
+        if h.remove1(&service_digest).is_some() {
+            warn!(
+                "Dropping previous control channel for service {}",
+                service_name
+            );
+        }
+
+        // Send ack
+        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+            .await?;
+        conn.flush().await?;
+
+        info!(service = %service_config.name, "Control channel established");
+        registry.set_active(&service_config.name).await;
+        let handle = ControlChannelHandle::new(
+            conn,
+            service_config,
+            server_config.heartbeat_interval,
+            registry,
+            pending_map,
+            approved_map,
+            approval_webhook,
+            approval_timeout,
+        );
+
+        // Push existing services to a newly connected GATEWAY client.
+        // Only push services that belong to this agent (or legacy unowned services).
+        if protocol::is_gateway_service(&handle.service.name) {
+            let svcs = services.read().await;
+            for svc in svcs.values() {
+                if protocol::is_gateway_service(&svc.name) {
+                    continue;
+                }
+                if !should_push_to_gateway(&svc.agent_id, &handle.agent_id) {
+                    continue;
+                }
+                let push_cfg = ServicePushConfig {
+                    name: svc.name.clone(),
+                    local_addr: svc.local_addr.clone().unwrap_or_default(),
+                    service_type: svc.service_type,
+                    token: svc
+                        .token
+                        .as_ref()
+                        .map(|t| t.to_string())
+                        .unwrap_or_default(),
+                    nodelay: svc.nodelay,
+                };
+                let _ = handle
+                    .cmd_tx
+                    .send(ControlChannelCmd::AddService(push_cfg));
+            }
+        }
+
+        // Insert the new handle
+        let _ = h.insert(service_digest, session_key, handle);
+    }
+
+    Ok(())
+}
+
+async fn do_data_channel_handshake<T: 'static + Transport>(
+    conn: T::Stream,
+    control_channels: Arc<RwLock<ControlChannelMap<T>>>,
+    nonce: Nonce,
+) -> Result<()> {
+    debug!("Try to handshake a data channel");
+
+    // Validate
+    let control_channels_guard = control_channels.read().await;
+    match control_channels_guard.get2(&nonce) {
+        Some(handle) => {
+            T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
+
+            // Send the data channel to the corresponding control channel
+            handle
+                .data_ch_tx
+                .send(conn)
+                .await
+                .with_context(|| "Data channel for a stale control channel")?;
+        }
+        None => {
+            warn!("Data channel has incorrect nonce");
+        }
+    }
+    Ok(())
+}
+
+pub struct ControlChannelHandle<T: Transport> {
+    // Shutdown the control channel by dropping it
+    _shutdown_tx: broadcast::Sender<bool>,
+    data_ch_tx: mpsc::Sender<T::Stream>,
+    service: ServerServiceConfig,
+    // Send push commands (AddService/RemoveService) to the control channel
+    cmd_tx: mpsc::UnboundedSender<ControlChannelCmd>,
+    // Marks service as disconnected when dropped
+    _registry_guard: RegistryGuard,
+    // Keep the data channel request sender alive (gateway channels have no pool to hold it)
+    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    // Agent ID for per-agent gateways (None for legacy __gateway__ or non-gateway services)
+    agent_id: Option<String>,
+}
+
+impl<T> ControlChannelHandle<T>
+where
+    T: 'static + Transport,
+{
+    // Create a control channel handle, where the control channel handling task
+    // and the connection pool task are created.
+    #[instrument(name = "handle", skip_all, fields(service = %service.name))]
+    fn new(
+        conn: T::Stream,
+        service: ServerServiceConfig,
+        heartbeat_interval: u64,
+        registry: Arc<ServiceRegistry>,
+        pending_map: PendingMap,
+        approved_map: ApprovedMap,
+        approval_webhook: Option<String>,
+        approval_timeout: u64,
+    ) -> ControlChannelHandle<T> {
+        let is_gateway = service.name == GATEWAY_SERVICE_NAME;
+
+        // Create a shutdown channel
+        let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
+
+        // Store data channels
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
+
+        // Store data channel creation requests
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
+
+        // Only create connection pool for non-gateway services
+        if !is_gateway {
+            // Cache some data channels for later use
+            let pool_size = match service.service_type {
+                ServiceType::Tcp => TCP_POOL_SIZE,
+                ServiceType::Udp => UDP_POOL_SIZE,
+            };
+
+            for _i in 0..pool_size {
+                if let Err(e) = data_ch_req_tx.send(true) {
+                    error!("Failed to request data channel {}", e);
+                };
+            }
+
+            let shutdown_rx_clone = shutdown_tx.subscribe();
+            let bind_addr = service.bind_addr.clone();
+            let service_name = service.name.clone();
+            let require_approval = service.require_approval;
+            let pool_req_tx = data_ch_req_tx.clone();
+            match service.service_type {
+                ServiceType::Tcp => tokio::spawn(
+                    async move {
+                        if let Err(e) = run_tcp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            pool_req_tx,
+                            shutdown_rx_clone,
+                            pending_map,
+                            approved_map,
+                            service_name,
+                            require_approval,
+                            approval_webhook,
+                            approval_timeout,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                ),
+                ServiceType::Udp => tokio::spawn(
+                    async move {
+                        if let Err(e) = run_udp_connection_pool::<T>(
+                            bind_addr,
+                            data_ch_rx,
+                            pool_req_tx,
+                            shutdown_rx_clone,
+                        )
+                        .await
+                        .with_context(|| "Failed to run TCP connection pool")
+                        {
+                            error!("{:#}", e);
+                        }
+                    }
+                    .instrument(Span::current()),
+                ),
+            };
+        }
+
+        // Channel for pushing commands from server to client
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+
+        // Create a registry guard that marks service disconnected on drop
+        let registry_guard = RegistryGuard::new(registry, service.name.clone());
+
+        // Create the control channel
+        let ch = ControlChannel::<T> {
+            conn,
+            shutdown_rx,
+            data_ch_req_rx,
+            heartbeat_interval,
+            cmd_rx,
+        };
+
+        // Run the control channel
+        tokio::spawn(
+            async move {
+                if let Err(err) = ch.run().await {
+                    error!("{:#}", err);
+                }
+            }
+            .instrument(Span::current()),
+        );
+
+        let agent_id = protocol::extract_agent_id(&service.name);
+
+        ControlChannelHandle {
+            _shutdown_tx: shutdown_tx,
+            data_ch_tx,
+            service,
+            cmd_tx,
+            _data_ch_req_tx: data_ch_req_tx,
+            _registry_guard: registry_guard,
+            agent_id,
+        }
+    }
+}
+
+// Control channel, using T as the transport layer
+struct ControlChannel<T: Transport> {
+    conn: T::Stream,                               // The connection of control channel
+    shutdown_rx: broadcast::Receiver<bool>,         // Receives the shutdown signal
+    data_ch_req_rx: mpsc::UnboundedReceiver<bool>,  // Receives visitor connections
+    heartbeat_interval: u64,                        // Application-layer heartbeat interval in secs
+    cmd_rx: mpsc::UnboundedReceiver<ControlChannelCmd>, // Receives push commands for the client
+}
+
+impl<T: Transport> ControlChannel<T> {
+    // Run a control channel
+    #[instrument(skip_all)]
+    async fn run(mut self) -> Result<()> {
+        // Wait for data channel requests, push commands, and the shutdown signal
+        loop {
+            tokio::select! {
+                val = self.data_ch_req_rx.recv() => {
+                    match val {
+                        Some(_) => {
+                            if let Err(e) = write_control_cmd(&mut self.conn, &ControlChannelCmd::CreateDataChannel).await {
+                                error!("{:#}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                },
+                // Push commands from server to client
+                cmd = self.cmd_rx.recv() => {
+                    match cmd {
+                        Some(cmd) => {
+                            if let Err(e) = write_control_cmd(&mut self.conn, &cmd).await {
+                                error!("Failed to push command: {:#}", e);
+                                break;
+                            }
+                        }
+                        None => {
+                            break;
+                        }
+                    }
+                },
+                _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
+                    if let Err(e) = write_control_cmd(&mut self.conn, &ControlChannelCmd::HeartBeat).await {
+                        error!("{:#}", e);
+                        break;
+                    }
+                }
+                // Wait for the shutdown signal
+                _ = self.shutdown_rx.recv() => {
+                    break;
+                }
+            }
+        }
+
+        info!("Control channel shutdown");
+
+        Ok(())
+    }
+}
+
+fn tcp_listen_and_send(
+    addr: String,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+    pending_map: PendingMap,
+    approved_map: ApprovedMap,
+    service_name: String,
+    require_approval: bool,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
+) -> mpsc::Receiver<TcpStream> {
+    let (tx, rx) = mpsc::channel(CHAN_SIZE);
+
+    tokio::spawn(async move {
+        let l = retry_notify_with_deadline(listen_backoff(),  || async {
+            Ok(TcpListener::bind(&addr).await?)
+        }, |e, duration| {
+            error!("{:#}. Retry in {:?}", e, duration);
+        }, &mut shutdown_rx).await
+        .with_context(|| "Failed to listen for the service");
+
+        let l: TcpListener = match l {
+            Ok(v) => v,
+            Err(e) => {
+                error!("{:#}", e);
+                return;
+            }
+        };
+
+        info!("Listening at {}", &addr);
+
+        // Retry at least every 1s
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_secs(1),
+            max_elapsed_time: None,
+            ..Default::default()
+        };
+
+        // Wait for visitors and the shutdown signal
+        loop {
+            tokio::select! {
+                val = l.accept() => {
+                    match val {
+                        Err(e) => {
+                            // `l` is a TCP listener so this must be a IO error
+                            // Possibly a EMFILE. So sleep for a while
+                            error!("{}. Sleep for a while", e);
+                            if let Some(d) = backoff.next_backoff() {
+                                time::sleep(d).await;
+                            } else {
+                                // This branch will never be reached for current backoff policy
+                                error!("Too many retries. Aborting...");
+                                break;
+                            }
+                        }
+                        Ok((incoming, addr)) => {
+                            backoff.reset();
+                            debug!("New visitor from {}", addr);
+
+                            if require_approval && !pending::is_approved(&approved_map, &service_name, addr.ip()).await {
+                                // Hold the connection and wait for approval
+                                let (id, approval_rx) = pending::insert(
+                                    &pending_map, &service_name, addr.to_string()
+                                ).await;
+
+                                info!("Pending approval {} for visitor {} on service {}", id, addr, service_name);
+
+                                // Fire webhook notification (fire-and-forget)
+                                #[cfg(feature = "api")]
+                                if let Some(ref webhook_url) = approval_webhook {
+                                    let url = webhook_url.clone();
+                                    let svc = service_name.clone();
+                                    let visitor = addr.to_string();
+                                    let pending_id = id.clone();
+                                    tokio::spawn(async move {
+                                        let payload = serde_json::json!({
+                                            "id": pending_id,
+                                            "service_name": svc,
+                                            "visitor_addr": visitor,
+                                        });
+                                        if let Err(e) = reqwest::Client::new()
+                                            .post(&url)
+                                            .json(&payload)
+                                            .timeout(Duration::from_secs(5))
+                                            .send()
+                                            .await
+                                        {
+                                            warn!("Failed to send approval webhook: {}", e);
+                                        }
+                                    });
+                                }
+
+                                // Spawn a task to wait for approval
+                                let tx_clone = tx.clone();
+                                let data_ch_req_tx_clone = data_ch_req_tx.clone();
+                                let timeout_dur = Duration::from_secs(approval_timeout);
+                                tokio::spawn(async move {
+                                    match time::timeout(timeout_dur, approval_rx).await {
+                                        Ok(Ok(true)) => {
+                                            // Approved - request data channel and send visitor
+                                            if data_ch_req_tx_clone.send(true).is_ok() {
+                                                let _ = tx_clone.send(incoming).await;
+                                            }
+                                            info!("Connection from {} approved", addr);
+                                        }
+                                        _ => {
+                                            // Denied, timed out, or oneshot dropped
+                                            info!("Connection from {} denied/timed out", addr);
+                                            drop(incoming);
+                                        }
+                                    }
+                                });
+                            } else {
+                                // Original behavior: immediate forwarding
+                                if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
+                                    // An error indicates the control channel is broken
+                                    break;
+                                }
+                                // Send the visitor to the connection pool
+                                let _ = tx.send(incoming).await;
+                            }
+                        }
+                    }
+                },
+                _ = shutdown_rx.recv() => {
+                    break;
+                }
+            }
+        }
+
+        info!("TCPListener shutdown");
+    }.instrument(Span::current()));
+
+    rx
+}
+
+#[instrument(skip_all)]
+async fn run_tcp_connection_pool<T: Transport>(
+    bind_addr: String,
+    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    shutdown_rx: broadcast::Receiver<bool>,
+    pending_map: PendingMap,
+    approved_map: ApprovedMap,
+    service_name: String,
+    require_approval: bool,
+    approval_webhook: Option<String>,
+    approval_timeout: u64,
+) -> Result<()> {
+    let mut visitor_rx = tcp_listen_and_send(
+        bind_addr,
+        data_ch_req_tx.clone(),
+        shutdown_rx,
+        pending_map,
+        approved_map,
+        service_name,
+        require_approval,
+        approval_webhook,
+        approval_timeout,
+    );
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
+
+    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
+        loop {
+            if let Some(mut ch) = data_ch_rx.recv().await {
+                if write_and_flush(&mut ch, &cmd).await.is_ok() {
+                    tokio::spawn(async move {
+                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                    });
+                    break;
+                } else {
+                    // Current data channel is broken. Request for a new one
+                    if data_ch_req_tx.send(true).is_err() {
+                        break 'pool;
+                    }
+                }
+            } else {
+                break 'pool;
+            }
+        }
+    }
+
+    info!("Shutdown");
+    Ok(())
+}
+
+#[instrument(skip_all)]
+async fn run_udp_connection_pool<T: Transport>(
+    bind_addr: String,
+    mut data_ch_rx: mpsc::Receiver<T::Stream>,
+    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    mut shutdown_rx: broadcast::Receiver<bool>,
+) -> Result<()> {
+    // TODO: Load balance
+
+    let l = retry_notify_with_deadline(
+        listen_backoff(),
+        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
+        |e, duration| {
+            warn!("{:#}. Retry in {:?}", e, duration);
+        },
+        &mut shutdown_rx,
+    )
+    .await
+    .with_context(|| "Failed to listen for the service")?;
+
+    info!("Listening at {}", &bind_addr);
+
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+
+    // Receive one data channel
+    let mut conn = data_ch_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow!("No available data channels"))?;
+    write_and_flush(&mut conn, &cmd).await?;
+
+    let mut buf = [0u8; UDP_BUFFER_SIZE];
+    loop {
+        tokio::select! {
+            // Forward inbound traffic to the client
+            val = l.recv_from(&mut buf) => {
+                let (n, from) = val?;
+                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
+            },
+
+            // Forward outbound traffic from the client to the visitor
+            hdr_len = conn.read_u8() => {
+                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
+                l.send_to(&t.data, t.from).await?;
+            }
+
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+        }
+    }
+
+    debug!("UDP pool dropped");
+
+    Ok(())
+}
