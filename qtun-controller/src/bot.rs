@@ -131,7 +131,7 @@ async fn answer(
         Cmd::Register(args) => {
             let agent_name = args.trim().to_string();
             if agent_name.is_empty() {
-                bot.send_message(msg.chat.id, "Usage: /register &lt;name&gt;")
+                bot.send_message(msg.chat.id, "Usage: /register &lt;agent_name&gt;")
                     .parse_mode(teloxide::types::ParseMode::Html)
                     .await?;
                 return Ok(());
@@ -237,7 +237,7 @@ async fn answer(
         Cmd::Unregister(args) => {
             let agent_name = args.trim().to_string();
             if agent_name.is_empty() {
-                bot.send_message(msg.chat.id, "Usage: /unregister &lt;name&gt;")
+                bot.send_message(msg.chat.id, "Usage: /unregister &lt;agent_name&gt;")
                     .parse_mode(teloxide::types::ParseMode::Html)
                     .await?;
                 return Ok(());
@@ -289,7 +289,7 @@ async fn answer(
             if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
                 bot.send_message(
                     msg.chat.id,
-                    "Usage: /create &lt;agent&gt; &lt;target:port&gt; [listen_port] [persist]",
+                    "Usage: /create &lt;agent_name&gt; &lt;ip:port&gt; [listen_port] [persist]\n\nExample: /create myagent 192.168.1.5:22\nExample: /create myagent 10.0.0.1:3389 5022 persist",
                 )
                 .parse_mode(teloxide::types::ParseMode::Html)
                 .await?;
@@ -462,7 +462,7 @@ async fn answer(
         Cmd::Kill(arg) => {
             let name = arg.trim().to_string();
             if name.is_empty() {
-                bot.send_message(msg.chat.id, "Usage: /kill &lt;name&gt;")
+                bot.send_message(msg.chat.id, "Usage: /kill &lt;tunnel_name&gt;")
                     .parse_mode(teloxide::types::ParseMode::Html)
                     .await?;
                 return Ok(());
@@ -517,7 +517,7 @@ async fn answer(
         Cmd::Activate(arg) => {
             let name = arg.trim().to_string();
             if name.is_empty() {
-                bot.send_message(msg.chat.id, "Usage: /activate &lt;name&gt;")
+                bot.send_message(msg.chat.id, "Usage: /activate &lt;tunnel_name&gt;")
                     .parse_mode(teloxide::types::ParseMode::Html)
                     .await?;
                 return Ok(());
