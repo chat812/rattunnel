@@ -427,6 +427,8 @@ async fn answer(
             for t in &tunnels {
                 let (icon, state_label) = if t.status == "idle" {
                     ("\u{1f4a4}", "Idle")
+                } else if t.status == "error" {
+                    ("\u{26a0}\u{fe0f}", "Error")
                 } else {
                     let state = states.get(&t.name).map(|s| s.as_str()).unwrap_or("Unknown");
                     let icon = match state {
@@ -530,13 +532,14 @@ async fn answer(
                             .await?;
                         return Ok(());
                     }
-                    if !t.persistent {
-                        bot.send_message(msg.chat.id, "This tunnel is not persistent. Only persistent tunnels can be activated.")
+                    if t.status == "active" {
+                        bot.send_message(msg.chat.id, "This tunnel is already active.")
                             .await?;
                         return Ok(());
                     }
-                    if t.status == "active" {
-                        bot.send_message(msg.chat.id, "This tunnel is already active.")
+                    if t.status != "idle" && t.status != "error" {
+                        bot.send_message(msg.chat.id, format!("Cannot activate tunnel in '{}' state.", escape_html(&t.status)))
+                            .parse_mode(teloxide::types::ParseMode::Html)
                             .await?;
                         return Ok(());
                     }

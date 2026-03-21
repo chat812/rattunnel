@@ -1,9 +1,10 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::time::{interval, Duration};
 
 use crate::config::Config;
 use crate::db::Db;
-use crate::port::kill_listener;
+use crate::port::{is_port_listening, kill_listener};
 use crate::rathole::RatholeClient;
 
 /// Check /proc/net/tcp and /proc/net/tcp6 for any ESTABLISHED connection
@@ -119,6 +120,89 @@ pub async fn run_cleanup(db: Arc<Db>, rathole: Arc<RatholeClient>, cfg: Arc<Conf
                 log::warn!("cleanup: set_idle '{}' failed: {}", t.name, e);
             }
             kill_listener(t.listen_port);
+        }
+    }
+}
+
+/// Connection watcher: every 15s, check active tunnels whose ports are not listening.
+/// Try to re-register them up to 3 times. If all retries fail, set status to "error".
+pub async fn run_connection_watcher(db: Arc<Db>, rathole: Arc<RatholeClient>) {
+    let mut ticker = interval(Duration::from_secs(15));
+    ticker.tick().await; // skip immediate first tick
+
+    // Track retry counts: tunnel name -> attempts so far
+    let mut retries: HashMap<String, u8> = HashMap::new();
+
+    loop {
+        ticker.tick().await;
+
+        let tunnels = match db.all() {
+            Ok(t) => t,
+            Err(e) => {
+                log::warn!("watcher: db.all() failed: {}", e);
+                continue;
+            }
+        };
+
+        // Get live service states from rathole
+        let live_states: HashMap<String, String> = rathole
+            .list()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| (s.name, s.state))
+            .collect();
+
+        // Clean up retries for tunnels that no longer exist or are idle
+        retries.retain(|name, _| tunnels.iter().any(|t| t.name == *name && t.status == "active"));
+
+        for t in &tunnels {
+            // Only watch active tunnels
+            if t.status != "active" {
+                continue;
+            }
+
+            // Check if rathole knows about this service and it's active
+            let rathole_state = live_states.get(&t.name).map(|s| s.as_str());
+
+            // If the port is listening, everything is fine — reset retries
+            if is_port_listening(t.listen_port) {
+                retries.remove(&t.name);
+                continue;
+            }
+
+            // Port not listening — this is a problem for an active tunnel
+            let attempt = retries.entry(t.name.clone()).or_insert(0);
+            *attempt += 1;
+
+            if *attempt > 3 {
+                // Already exceeded retries, set to error
+                log::error!(
+                    "watcher: tunnel '{}' port {} not listening after 3 retries — marking as error",
+                    t.name, t.listen_port,
+                );
+                if let Err(e) = db.set_error(&t.name) {
+                    log::warn!("watcher: set_error('{}') failed: {}", t.name, e);
+                }
+                retries.remove(&t.name);
+                continue;
+            }
+
+            log::warn!(
+                "watcher: tunnel '{}' port {} not listening (attempt {}/3) — re-registering",
+                t.name, t.listen_port, attempt,
+            );
+
+            // Try to re-register on rathole
+            // First remove if it exists in a bad state
+            if rathole_state.is_some() {
+                let _ = rathole.remove(&t.name).await;
+            }
+
+            let bind_addr = format!("0.0.0.0:{}", t.listen_port);
+            if let Err(e) = rathole.add(&t.name, &bind_addr, &t.target, true, t.agent_id.as_deref()).await {
+                log::warn!("watcher: re-register '{}' failed: {}", t.name, e);
+            }
         }
     }
 }

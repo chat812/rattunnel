@@ -64,6 +64,11 @@ fn process_name(pid: u32) -> String {
         .to_string()
 }
 
+/// Check if anything is listening on the given port.
+pub fn is_port_listening(port: u16) -> bool {
+    listening_inode(port).is_some()
+}
+
 /// If anything is still listening on `port`, find it and kill it.
 /// Returns true if a process was killed.
 pub fn kill_listener(port: u16) -> bool {

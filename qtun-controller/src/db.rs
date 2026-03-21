@@ -351,4 +351,14 @@ impl Db {
         )?;
         Ok(())
     }
+
+    /// Set a tunnel's status to error.
+    pub fn set_error(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE tunnels SET status = 'error' WHERE name = ?1",
+            params![name],
+        )?;
+        Ok(())
+    }
 }

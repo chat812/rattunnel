@@ -119,6 +119,15 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Connection watcher in background (re-register tunnels whose ports stopped listening)
+    {
+        let w_db = db.clone();
+        let w_rat = rathole.clone();
+        tokio::spawn(async move {
+            cleanup::run_connection_watcher(w_db, w_rat).await;
+        });
+    }
+
     log::info!("Idle timeout: {}s — checking every 60s", cfg.idle_timeout_secs);
 
     // Webhook server for connection approval notifications
