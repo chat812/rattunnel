@@ -10,7 +10,28 @@ mod port;
 mod rathole;
 mod webhook;
 
+async fn wait_for_rathole(rathole: &rathole::RatholeClient) {
+    log::info!("Waiting for rathole API to be ready...");
+    for attempt in 1..=30 {
+        match rathole.list().await {
+            Ok(_) => {
+                log::info!("Rathole API ready (attempt {})", attempt);
+                return;
+            }
+            Err(_) => {
+                if attempt % 5 == 0 {
+                    log::warn!("Rathole API not ready yet (attempt {}), retrying...", attempt);
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+    log::error!("Rathole API did not become ready after 30 seconds, proceeding anyway");
+}
+
 async fn restore_state(db: &db::Db, rathole: &rathole::RatholeClient) {
+    wait_for_rathole(rathole).await;
+
     // Re-register all agents
     let agents = db.all_agents().unwrap_or_default();
     for agent in &agents {
