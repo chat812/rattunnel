@@ -496,12 +496,13 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         conn.flush().await?;
 
         info!(service = %service_config.name, "Control channel established");
-        registry.set_active(&service_config.name).await;
+        let connected_at = registry.set_active(&service_config.name).await;
         let handle = ControlChannelHandle::new(
             conn,
             service_config,
             server_config.heartbeat_interval,
             registry,
+            connected_at,
             pending_map,
             approved_map,
             approval_webhook,
@@ -597,6 +598,7 @@ where
         service: ServerServiceConfig,
         heartbeat_interval: u64,
         registry: Arc<ServiceRegistry>,
+        connected_at: Option<std::time::Instant>,
         pending_map: PendingMap,
         approved_map: ApprovedMap,
         approval_webhook: Option<String>,
@@ -678,7 +680,7 @@ where
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
 
         // Create a registry guard that marks service disconnected on drop
-        let registry_guard = RegistryGuard::new(registry, service.name.clone());
+        let registry_guard = RegistryGuard::new(registry, service.name.clone(), connected_at);
 
         // Create the control channel
         let ch = ControlChannel::<T> {

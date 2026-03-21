@@ -54,22 +54,30 @@ impl ServiceRegistry {
         );
     }
 
-    /// Mark a service as active (client connected).
-    pub async fn set_active(&self, name: &str) {
+    /// Mark a service as active (client connected). Returns the connection timestamp
+    /// so it can be used as a generation marker in RegistryGuard.
+    pub async fn set_active(&self, name: &str) -> Option<Instant> {
         let mut map = self.services.write().await;
         if let Some(info) = map.get_mut(name) {
+            let now = Instant::now();
             info.state = ServiceState::Active;
-            info.connected_since = Some(Instant::now());
-            info.last_heartbeat = Some(Instant::now());
+            info.connected_since = Some(now);
+            info.last_heartbeat = Some(now);
+            Some(now)
+        } else {
+            None
         }
     }
 
-    /// Mark a service as disconnected.
-    pub async fn set_disconnected(&self, name: &str) {
+    /// Mark a service as disconnected, but only if the connection generation matches.
+    /// This prevents a stale drop guard from reverting a newer reconnection to Disconnected.
+    pub async fn set_disconnected_if_same_generation(&self, name: &str, generation: Option<Instant>) {
         let mut map = self.services.write().await;
         if let Some(info) = map.get_mut(name) {
-            info.state = ServiceState::Disconnected;
-            info.connected_since = None;
+            if info.connected_since == generation {
+                info.state = ServiceState::Disconnected;
+                info.connected_since = None;
+            }
         }
     }
 
@@ -103,16 +111,21 @@ impl ServiceRegistry {
 
 /// Wrapper for sharing the registry with a drop guard that marks
 /// a service as disconnected when the control channel is dropped.
+/// Uses `connected_since` as a generation marker to avoid race conditions
+/// when a new connection replaces the old one.
 pub struct RegistryGuard {
     registry: Arc<ServiceRegistry>,
     service_name: String,
+    /// Snapshot of connected_since at the time this guard was created.
+    connected_at: Option<Instant>,
 }
 
 impl RegistryGuard {
-    pub fn new(registry: Arc<ServiceRegistry>, service_name: String) -> Self {
+    pub fn new(registry: Arc<ServiceRegistry>, service_name: String, connected_at: Option<Instant>) -> Self {
         RegistryGuard {
             registry,
             service_name,
+            connected_at,
         }
     }
 }
@@ -121,8 +134,9 @@ impl Drop for RegistryGuard {
     fn drop(&mut self) {
         let registry = self.registry.clone();
         let name = self.service_name.clone();
+        let my_connected_at = self.connected_at;
         tokio::spawn(async move {
-            registry.set_disconnected(&name).await;
+            registry.set_disconnected_if_same_generation(&name, my_connected_at).await;
         });
     }
 }
