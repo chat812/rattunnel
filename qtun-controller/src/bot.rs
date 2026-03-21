@@ -13,21 +13,21 @@ use crate::rathole::RatholeClient;
 #[derive(BotCommands, Clone)]
 #[command(rename_rule = "lowercase", description = "QuickTun — tunnel controller")]
 pub enum Cmd {
-    #[command(description = "<name> — Register a new agent")]
+    #[command(description = "<agent_name> — Register a new agent")]
     Register(String),
     #[command(description = "List your registered agents")]
     Agents,
-    #[command(description = "<name> — Unregister an agent")]
+    #[command(description = "<agent_name> — Unregister an agent and its tunnels")]
     Unregister(String),
-    #[command(description = "<agent> <target:port> [listen_port] [persist] — Create a tunnel")]
+    #[command(description = "<agent> <ip:port> [port] [persist] — Create tunnel")]
     Create(String),
-    #[command(description = "List your tunnels")]
+    #[command(description = "List your tunnels with status")]
     List,
-    #[command(description = "<name> — Kill a tunnel")]
+    #[command(description = "<tunnel_name> — Remove a tunnel")]
     Kill(String),
-    #[command(description = "<name> — Activate an idle persistent tunnel")]
+    #[command(description = "<tunnel_name> — Resume an idle persistent tunnel")]
     Activate(String),
-    #[command(description = "Show agent download links")]
+    #[command(description = "Get time-limited agent download links")]
     Download,
 }
 
