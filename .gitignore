@@ -10,6 +10,7 @@ qtun-controller/.env
 # Runtime data
 *.db
 *.db-journal
+qtun-data/
 
 # OS
 .DS_Store

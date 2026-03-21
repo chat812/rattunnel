@@ -18,13 +18,10 @@ services:
     network_mode: host
     volumes:
       - ./qtun-controller/config.toml:/app/config.toml:ro
-      - qtun-data:/app/data
+      - ./qtun-data:/app/data
       - ./build/agents:/app/agents:ro
     environment:
       - RUST_LOG=${RUST_LOG:-info}
     depends_on:
       - rathole
     restart: unless-stopped
-
-volumes:
-  qtun-data:

@@ -148,6 +148,19 @@ impl RatholeClient {
         Ok(())
     }
 
+    pub async fn clear_approved(&self, service_name: &str) -> Result<()> {
+        let resp = self
+            .client
+            .delete(format!("{}/api/v1/approved/{}", self.base, service_name))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("rathole clear_approved error: {}", text);
+        }
+        Ok(())
+    }
+
     pub async fn deny_connection(&self, id: &str) -> Result<()> {
         let resp = self
             .client

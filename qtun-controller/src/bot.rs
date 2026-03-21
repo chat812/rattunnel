@@ -19,12 +19,14 @@ pub enum Cmd {
     Agents,
     #[command(description = "<name> — Unregister an agent")]
     Unregister(String),
-    #[command(description = "<agent> <target:port> [listen_port] — Create a tunnel")]
+    #[command(description = "<agent> <target:port> [listen_port] [persist] — Create a tunnel")]
     Create(String),
     #[command(description = "List your tunnels")]
     List,
     #[command(description = "<name> — Kill a tunnel")]
     Kill(String),
+    #[command(description = "<name> — Activate an idle persistent tunnel")]
+    Activate(String),
     #[command(description = "Show agent download links")]
     Download,
 }
@@ -283,11 +285,11 @@ async fn answer(
         }
 
         Cmd::Create(args) => {
-            let parts: Vec<&str> = args.trim().splitn(3, ' ').collect();
+            let parts: Vec<&str> = args.trim().split_whitespace().collect();
             if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
                 bot.send_message(
                     msg.chat.id,
-                    "Usage: /create &lt;agent_name&gt; &lt;target_ip:port&gt; [listen_port]",
+                    "Usage: /create &lt;agent&gt; &lt;target:port&gt; [listen_port] [persist]",
                 )
                 .parse_mode(teloxide::types::ParseMode::Html)
                 .await?;
@@ -296,6 +298,9 @@ async fn answer(
 
             let agent_name = parts[0];
             let target = parts[1];
+
+            // Check for "persist" flag anywhere in remaining args
+            let persistent = parts[2..].iter().any(|p| p.eq_ignore_ascii_case("persist"));
 
             // Look up agent
             let agent = match db.find_agent_by_name(msg.chat.id.0, agent_name) {
@@ -324,17 +329,14 @@ async fn answer(
                 return Ok(());
             }
 
-            let listen_port = if parts.len() > 2 && !parts[2].trim().is_empty() {
-                match parts[2].trim().parse::<u16>() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        bot.send_message(msg.chat.id, "Invalid listen port number.")
-                            .await?;
-                        return Ok(());
-                    }
-                }
-            } else {
-                gen_port(&db, &cfg)
+            // Find a numeric port in remaining args (skip "persist" keyword)
+            let listen_port = parts[2..].iter()
+                .filter(|p| !p.eq_ignore_ascii_case("persist"))
+                .next()
+                .and_then(|p| p.parse::<u16>().ok());
+            let listen_port = match listen_port {
+                Some(p) => p,
+                None => gen_port(&db, &cfg),
             };
 
             if db.port_in_use(listen_port).unwrap_or(false) {
@@ -363,7 +365,7 @@ async fn answer(
                 return Ok(());
             }
 
-            if let Err(e) = db.insert(&name, &subdomain, target, listen_port, msg.chat.id.0, Some(&agent.agent_id)) {
+            if let Err(e) = db.insert(&name, &subdomain, target, listen_port, msg.chat.id.0, Some(&agent.agent_id), persistent) {
                 let _ = rathole.remove(&name).await;
                 bot.send_message(
                     msg.chat.id,
@@ -377,19 +379,21 @@ async fn answer(
                 return Ok(());
             }
 
+            let persist_label = if persistent { "\n\u{1f4cc} <b>Mode:</b>   Persistent (idles after 30m, use /activate to resume)" } else { "" };
             let text = format!(
                 "\u{2705} <b>Tunnel created!</b>\n\n\
                  \u{1f3f7} <b>Name:</b>   <code>{name}</code>\n\
                  \u{1f4e1} <b>Agent:</b>  <code>{agent_name}</code>\n\
                  \u{1f310} <b>Domain:</b> <code>{subdomain}</code>\n\
                  \u{1f3af} <b>Target:</b> <code>{target}</code>\n\
-                 \u{1f6aa} <b>Port:</b>   <code>{listen_port}</code>\n\n\
+                 \u{1f6aa} <b>Port:</b>   <code>{listen_port}</code>{persist_label}\n\n\
                  \u{1f517} <b>Connect:</b> <code>{subdomain}:{listen_port}</code>",
                 name = escape_html(&name),
                 agent_name = escape_html(agent_name),
                 subdomain = escape_html(&subdomain),
                 target = escape_html(target),
                 listen_port = listen_port,
+                persist_label = persist_label,
             );
             bot.send_message(msg.chat.id, text)
                 .parse_mode(teloxide::types::ParseMode::Html)
@@ -421,22 +425,29 @@ async fn answer(
 
             let mut text = String::from("\u{1f310} <b>Your Tunnels</b>\n\n");
             for t in &tunnels {
-                let state = states.get(&t.name).map(|s| s.as_str()).unwrap_or("Unknown");
-                let icon = match state {
-                    "Active" => "\u{1f7e2}",
-                    "Registered" => "\u{1f7e1}",
-                    _ => "\u{1f534}",
+                let (icon, state_label) = if t.status == "idle" {
+                    ("\u{1f4a4}", "Idle")
+                } else {
+                    let state = states.get(&t.name).map(|s| s.as_str()).unwrap_or("Unknown");
+                    let icon = match state {
+                        "Active" => "\u{1f7e2}",
+                        "Registered" => "\u{1f7e1}",
+                        _ => "\u{1f534}",
+                    };
+                    (icon, state)
                 };
                 let agent_label = t.agent_id.as_ref()
                     .and_then(|id| agent_names.get(id).map(|n| n.as_str()))
                     .unwrap_or("-");
+                let persist_tag = if t.persistent { " \u{1f4cc}" } else { "" };
                 text.push_str(&format!(
-                    "{} <b>{}</b>  <i>{}</i>\n\
+                    "{} <b>{}</b>  <i>{}</i>{}\n\
                      \u{00a0}\u{00a0}\u{00a0}\u{00a0}\u{1f4e1} {} \u{2192} \u{1f3af} <code>{}</code>\n\
                      \u{00a0}\u{00a0}\u{00a0}\u{00a0}\u{1f517} <code>{}:{}</code>\n\n",
                     icon,
                     escape_html(&t.name),
-                    escape_html(state),
+                    escape_html(state_label),
+                    persist_tag,
                     escape_html(agent_label),
                     escape_html(&t.target),
                     escape_html(&t.subdomain),
@@ -499,6 +510,79 @@ async fn answer(
                     )
                     .parse_mode(teloxide::types::ParseMode::Html)
                     .await?;
+                }
+            }
+        }
+
+        Cmd::Activate(arg) => {
+            let name = arg.trim().to_string();
+            if name.is_empty() {
+                bot.send_message(msg.chat.id, "Usage: /activate &lt;name&gt;")
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+                return Ok(());
+            }
+
+            match db.find_by_name(&name) {
+                Ok(Some(t)) => {
+                    if t.creator_chat_id != msg.chat.id.0 {
+                        bot.send_message(msg.chat.id, "\u{26d4} You can only activate your own tunnels.")
+                            .await?;
+                        return Ok(());
+                    }
+                    if !t.persistent {
+                        bot.send_message(msg.chat.id, "This tunnel is not persistent. Only persistent tunnels can be activated.")
+                            .await?;
+                        return Ok(());
+                    }
+                    if t.status == "active" {
+                        bot.send_message(msg.chat.id, "This tunnel is already active.")
+                            .await?;
+                        return Ok(());
+                    }
+
+                    // Re-register on rathole
+                    let bind_addr = format!("0.0.0.0:{}", t.listen_port);
+                    if let Err(e) = rathole.add(&t.name, &bind_addr, &t.target, true, t.agent_id.as_deref()).await {
+                        bot.send_message(
+                            msg.chat.id,
+                            format!("Failed to reactivate tunnel: {}", escape_html(&e.to_string())),
+                        )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                        return Ok(());
+                    }
+
+                    if let Err(e) = db.set_active(&t.name) {
+                        log::warn!("set_active('{}') failed: {}", t.name, e);
+                    }
+
+                    let text = format!(
+                        "\u{26a1} <b>Tunnel activated!</b>\n\n\
+                         \u{1f3f7} <b>Name:</b>   <code>{}</code>\n\
+                         \u{1f3af} <b>Target:</b> <code>{}</code>\n\
+                         \u{1f517} <b>Connect:</b> <code>{}:{}</code>",
+                        escape_html(&t.name),
+                        escape_html(&t.target),
+                        escape_html(&t.subdomain),
+                        t.listen_port,
+                    );
+                    bot.send_message(msg.chat.id, text)
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
+                }
+                Ok(None) => {
+                    bot.send_message(
+                        msg.chat.id,
+                        format!("No tunnel named <code>{}</code> found.", escape_html(&name)),
+                    )
+                    .parse_mode(teloxide::types::ParseMode::Html)
+                    .await?;
+                }
+                Err(e) => {
+                    bot.send_message(msg.chat.id, format!("Database error: {}", escape_html(&e.to_string())))
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .await?;
                 }
             }
         }

@@ -10,6 +10,38 @@ mod port;
 mod rathole;
 mod webhook;
 
+async fn restore_state(db: &db::Db, rathole: &rathole::RatholeClient) {
+    // Re-register all agents
+    let agents = db.all_agents().unwrap_or_default();
+    for agent in &agents {
+        if let Err(e) = rathole.register_agent(&agent.agent_id, &agent.token).await {
+            log::warn!("Failed to restore agent '{}' ({}): {}", agent.name, agent.agent_id, e);
+        }
+    }
+    if !agents.is_empty() {
+        log::info!("Restored {} agent(s)", agents.len());
+    }
+
+    // Re-register active tunnels (skip idle persistent ones)
+    let tunnels = db.all().unwrap_or_default();
+    let mut restored = 0;
+    let mut skipped_idle = 0;
+    for t in &tunnels {
+        if t.status == "idle" {
+            skipped_idle += 1;
+            continue;
+        }
+        let bind_addr = format!("0.0.0.0:{}", t.listen_port);
+        if let Err(e) = rathole.add(&t.name, &bind_addr, &t.target, true, t.agent_id.as_deref()).await {
+            log::warn!("Failed to restore tunnel '{}': {}", t.name, e);
+        }
+        restored += 1;
+    }
+    if restored > 0 || skipped_idle > 0 {
+        log::info!("Restored {} tunnel(s), {} idle persistent tunnel(s) skipped", restored, skipped_idle);
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // --config <path>  (default: config.toml next to the binary)
@@ -42,6 +74,9 @@ async fn main() -> anyhow::Result<()> {
     let db = Arc::new(db::Db::new(&cfg.db_path)?);
     let rathole = Arc::new(rathole::RatholeClient::new(&cfg.rathole_api));
     let dl_tokens = Arc::new(download::DownloadTokenStore::new());
+
+    // Restore agents and tunnels from DB into rathole
+    restore_state(&db, &rathole).await;
 
     // DNS server in background
     {

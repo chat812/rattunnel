@@ -69,7 +69,7 @@ pub async fn run_cleanup(db: Arc<Db>, rathole: Arc<RatholeClient>, cfg: Arc<Conf
             }
         }
 
-        // Remove idle tunnels
+        // Remove idle non-persistent tunnels
         let idle = match db.idle_tunnels(cfg.idle_timeout_secs) {
             Ok(v) => v,
             Err(e) => {
@@ -88,6 +88,35 @@ pub async fn run_cleanup(db: Arc<Db>, rathole: Arc<RatholeClient>, cfg: Arc<Conf
             }
             if let Err(e) = db.delete(&t.name) {
                 log::warn!("cleanup: db delete '{}' failed: {}", t.name, e);
+            }
+            kill_listener(t.listen_port);
+        }
+
+        // Put idle persistent tunnels to sleep (30 min idle threshold)
+        let persistent_idle_secs = 1800; // 30 minutes
+        let idle_persistent = match db.idle_persistent_tunnels(persistent_idle_secs) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("cleanup: idle_persistent_tunnels() failed: {}", e);
+                continue;
+            }
+        };
+
+        for t in idle_persistent {
+            log::info!(
+                "cleanup: idling persistent tunnel '{}' ({}) — no traffic for >{}s",
+                t.name, t.target, persistent_idle_secs,
+            );
+            // Remove from rathole (stop listening) but keep in DB
+            if let Err(e) = rathole.remove(&t.name).await {
+                log::warn!("cleanup: rathole remove '{}' failed: {}", t.name, e);
+            }
+            // Clear approved IPs
+            if let Err(e) = rathole.clear_approved(&t.name).await {
+                log::warn!("cleanup: clear_approved '{}' failed: {}", t.name, e);
+            }
+            if let Err(e) = db.set_idle(&t.name) {
+                log::warn!("cleanup: set_idle '{}' failed: {}", t.name, e);
             }
             kill_listener(t.listen_port);
         }

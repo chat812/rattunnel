@@ -272,6 +272,15 @@ async fn handle_request(
             }
         }
 
+        // DELETE /api/v1/approved/:service_name - clear approved IPs for a service
+        (Method::DELETE, ["api", "v1", "approved", service_name]) => {
+            pending::clear_approved(&state.approved_map, service_name).await;
+            json_response(
+                StatusCode::OK,
+                &serde_json::json!({"status": "cleared"}).to_string(),
+            )
+        }
+
         // POST /api/v1/pending/:id/deny - deny a pending connection
         (Method::POST, ["api", "v1", "pending", id, "deny"]) => {
             match pending::deny(&state.pending_map, id).await {
